@@ -1,0 +1,12 @@
+{
+  "name": "mi-coche-api",
+  "private": true,
+  "cloudflare": {
+    "bindings": {
+      "APP_KEY": { "description": "Contraseña para entrar en tu app. Invéntate una larga (por ejemplo 4 palabras juntas) y apúntala: la pedirá la app del móvil." },
+      "FUEL_TYPE": { "description": "Gasolina que usas: 95 o 98." },
+      "PROVINCE": { "description": "Código de tu provincia para los precios de gasolina (Tarragona 43, Barcelona 08, Lleida 25, Girona 17, Valencia 46, Castellón 12, Madrid 28…)." },
+      "SOURCE": { "description": "Déjalo en mock: la app enseña datos de ejemplo hasta que conectes tu Ford." }
+    }
+  }
+}

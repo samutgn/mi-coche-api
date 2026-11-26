@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mi-coche-api",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "d1_databases": [
+    { "binding": "DB", "database_name": "mi_coche","database_id": "aeaa2659-31dc-428c-ac66-449738a1514c" }
+  ],
+  "ai": { "binding": "AI" },
+  "kv_namespaces": [
+    { "binding": "BACKUPS","id": "5e8b44ef46114324b8d54c7770c16823" }
+  ],
+  "vars": {
+    "SOURCE": "mock",
+    "FUEL_TYPE": "95",
+    "PROVINCE": "43"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "observability": { "enabled": true }
+}
