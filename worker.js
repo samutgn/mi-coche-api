@@ -1,10 +1,10 @@
-// Fiesta ST Garaje — servidor (Cloudflare Worker)
+// Mi Garaje — servidor (Cloudflare Worker)
 // Configuración en wrangler.jsonc (base de datos DB, variable SOURCE, cron cada minuto).
 // Secret APP_KEY: contraseña de la app.
 // SOURCE = "mock" (coche simulado) o "ford" (coche real).
 
 const SCHEMA = '3';
-let TANK_L = 45;                 // depósito (Fiesta ST Mk8: 45 L); se cambia en Ajustes → Tu coche
+let TANK_L = 52;                 // depósito (Focus ST 2.3: 52 L); se cambia en Ajustes → Tu coche
 const LIVE_MIN_INTERVAL_S = 30;  // con Ford real: no consultar más a menudo
 const GAP_PARKED_S = 300;        // registro del histórico aparcado
 const GAP_DRIVING_S = 60;        // registro del histórico en marcha
@@ -141,7 +141,7 @@ export default {
       if (m === 'GET' && p === '/api/push/key') return json({ key: (await vapidKeys(env)).pub });
       if (m === 'POST' && p === '/api/push/subscribe') return json(await subscribe(env, await req.json()));
       if (m === 'POST' && p === '/api/push/test') {
-        return json(await sendPushAll(env, { title: 'Fiesta ST', body: 'Los avisos funcionan correctamente.', url: '#estado', tag: 'test' }));
+        return json(await sendPushAll(env, { title: 'Mi Garaje', body: 'Los avisos funcionan correctamente.', url: '#estado', tag: 'test' }));
       }
       return json({ error: 'Ruta no encontrada' }, 404);
     } catch (e) {
@@ -338,22 +338,24 @@ function mapTelemetry(data) {
   for (const k in tyres) if (!tyres_low.includes(k) && tyre_ref[k] && tyres[k] < tyre_ref[k] * 0.88) tyres_low.push(k);
   const side = x => (x === 'DRIVER' ? 'izq.' : x === 'PASSENGER' ? 'der.' : '');
   const doors = Array.isArray(m.doorStatus) ? m.doorStatus : [];
-  const doors_open = doors.filter(d => d.value && !/CLOSED|UNKNOWN|UNDEFINED/i.test(String(d.value)))
+  const doors_open = doors.filter(d => d.value && !/CLOSED|UNKNOWN|UNDEFINED|INVALID/i.test(String(d.value)))
     .map(d => {
       const p = d.vehiclePart || d.vehicleDoor;
       if (p === 'UNSPECIFIED_FRONT') return 'puerta delantera ' + side(d.vehicleSide);
       return DOORS_ES[p] || String(p || 'puerta').toLowerCase();
     });
-  if (val('hoodStatus') && !/CLOSED|UNDEFINED/i.test(String(val('hoodStatus')))) doors_open.push('capó');
+  if (val('hoodStatus') && !/CLOSED|UNKNOWN|UNDEFINED|INVALID/i.test(String(val('hoodStatus')))) doors_open.push('capó');
   const windows_open = (Array.isArray(m.windowStatus) ? m.windowStatus : [])
-    .filter(w => { const r = w.value && w.value.doubleRange; return r ? num(r.upperBound) > 0 : w.value && !/CLOSED|UNDEFINED/i.test(String(w.value)); })
+    .filter(w => { const r = w.value && w.value.doubleRange; return r ? num(r.upperBound) > 0 : w.value && !/CLOSED|UNKNOWN|UNDEFINED|INVALID/i.test(String(w.value)); })
     .map(w => 'ventana ' + (/REAR/.test(w.vehicleWindow) ? 'trasera ' : 'delantera ') + side(w.vehicleSide));
+  // Solo cuentan valores claros: UNKNOWN, INVALID, etc. son "sin dato", no "abierto".
+  const lockVal = v => { const s = String(v).toUpperCase(); return /UNLOCK/.test(s) ? false : /^(DOUBLE_)?LOCKED$/.test(s) ? true : null; };
   let locked = null;
   const lk = m.doorLockStatus;
   if (Array.isArray(lk)) {
     const all = lk.find(d => /ALL/.test(String(d.vehicleDoor || ''))) || lk[0];
-    if (all && all.value != null) locked = /LOCK/i.test(all.value) && !/UNLOCK/i.test(all.value);
-  } else if (lk && lk.value != null) locked = /LOCK/i.test(lk.value) && !/UNLOCK/i.test(lk.value);
+    if (all && all.value != null) locked = lockVal(all.value);
+  } else if (lk && lk.value != null) locked = lockVal(lk.value);
   const pos = val('position');
   const loc = pos && pos.location && pos.location.lat != null ? { lat: +pos.location.lat, lon: +pos.location.lon } : null;
   // En cambio manual Ford solo informa la marcha atrás y se queda la última lectura: si es más vieja que el arranque, no vale.
@@ -380,6 +382,7 @@ function mapTelemetry(data) {
     tyres_low,
     locked,
     doors_open,
+    doors_known: doors.some(d => /CLOSED|OPEN|AJAR/i.test(String(d.value))),
     windows_open,
     ignition: running ? 'run' : 'off',
     ignition_raw: ign,
@@ -448,11 +451,21 @@ async function fordStatus(env) {
   };
 }
 
+// ---------- Hora de Madrid (con cambio de verano e invierno) ----------
+// Verano: del último domingo de marzo al último de octubre, ambos a las 01:00 UTC.
+function lastSunday(y, month) { const d = new Date(Date.UTC(y, month + 1, 0, 1)); d.setUTCDate(d.getUTCDate() - d.getUTCDay()); return d.getTime(); }
+function madridOffset(ts) { const y = new Date(ts).getUTCFullYear(); return ts >= lastSunday(y, 2) && ts < lastSunday(y, 9) ? 7200e3 : 3600e3; }
+const toLocal = ts => ts + madridOffset(ts);                 // para leer con getUTC* o toISOString
+const fromLocal = l => l - madridOffset(l - 3600e3);         // de hora de Madrid a instante real
+const sqlDay = col => { const s = `(${col} / 1000)`, y = `strftime('%Y', ${s}, 'unixepoch')`;
+  const edge = md => `CAST(strftime('%s', date(${y} || '${md}', '-6 days', 'weekday 0'), '+1 hour') AS INTEGER)`;
+  return `date(${s} + CASE WHEN ${s} >= ${edge('-03-31')} AND ${s} < ${edge('-10-31')} THEN 7200 ELSE 3600 END, 'unixepoch')`; };
+
 // Coche simulado: función pura del tiempo, así el histórico es coherente.
 function mockCar(now) {
   const BASE = Date.UTC(2026, 9, 1);
   const DAY = 86400e3;
-  const local = now + 3600e3; // hora peninsular aprox.
+  const local = toLocal(now);
   const days = Math.floor((local - BASE) / DAY);
   const minF = ((local - BASE) % DAY) / 60000;
   const trips = [[450, 20, 20], [960, 25, 25]]; // inicio (min), duración (min), km
@@ -573,7 +586,7 @@ function processCar(db, st, c, opts = {}) {
   if (running) {
     if (!st.trip) {
       if (opts.guard && guardActive(opts.guard, c.ts)) {
-        notes.push({ title: '⚠️ El coche se ha encendido', body: `Tu Fiesta ST se ha puesto en marcha a las ${hhmm(c.ts)}. Si no eres tú, revisa dónde está.`, url: '#estado', tag: 'guard', urgent: true });
+        notes.push({ title: '⚠️ El coche se ha encendido', body: `Tu Focus ST se ha puesto en marcha a las ${hhmm(c.ts)}. Si no eres tú, revisa dónde está.`, url: '#estado', tag: 'guard', urgent: true });
       }
       if (c.tyres && !c.track && (c.coolant_c ?? c.oil_c ?? 99) < 45) st.coldTyres = { ts: c.data_ts || c.ts, ...c.tyres };
       st.trip = {
@@ -606,7 +619,7 @@ function processCar(db, st, c, opts = {}) {
     const warmT = c.oil_c ?? c.coolant_c, warmMax = c.oil_c != null ? OIL_WARM : 85;
     if (!t.warm && t.start_oil != null && t.start_oil < 60 && warmT >= warmMax) {
       t.warm = true;
-      notes.push({ title: 'Motor a temperatura', body: `${c.oil_c != null ? 'Aceite' : 'Refrigerante'} a ${warmT} °C. Ya puedes apretar.`, url: '#motor', tag: 'warm' });
+      notes.push({ title: 'Motor a temperatura', body: c.oil_c != null ? `Aceite a ${warmT} °C.` : `Refrigerante a ${warmT} °C. No hay dato del aceite, que puede seguir frío.`, url: '#motor', tag: 'warm' });
     }
   } else if (st.trip) {
     const t = st.trip;
@@ -677,7 +690,7 @@ function processCar(db, st, c, opts = {}) {
   } else st.unlockedSince = null;
   if (c.track) for (const k in cur) if (k.startsWith('tyre_')) delete cur[k];
   for (const k in cur) {
-    if (!st.alerts.includes(k)) notes.push({ title: 'Fiesta ST', body: cur[k], url: '#estado', tag: k });
+    if (!st.alerts.includes(k)) notes.push({ title: 'Mi Garaje', body: cur[k], url: '#estado', tag: k });
   }
   st.alerts = Object.keys(cur);
   return { stmts, notes };
@@ -749,7 +762,7 @@ async function ingest(env, car, st) {
   if (st.coldTyres) {
     const ct = st.coldTyres; delete st.coldTyres;
     const row = await env.DB.prepare("SELECT v FROM kv WHERE k = 'cold_tyres'").first();
-    const day = new Date(ct.ts + 3600e3).toISOString().slice(0, 10);
+    const day = new Date(toLocal(ct.ts)).toISOString().slice(0, 10);
     const hist = (row ? JSON.parse(row.v) : []).filter(h => h.d !== day);
     hist.push({ d: day, ts: ct.ts, fl: ct.fl, fr: ct.fr, rl: ct.rl, rr: ct.rr, src: 'arranque' });
     while (hist.length > 30) hist.shift();
@@ -768,7 +781,7 @@ function titleCase(t) { return String(t || '').toLowerCase().replace(/(^|[\s-])\
 
 // Revisión diaria a las 9:00: mantenimiento y batería.
 async function daily(env, when) {
-  const local = new Date(when + 3600e3);
+  const local = new Date(toLocal(when));
   if (local.getUTCHours() !== 9) return;
   const day = local.toISOString().slice(0, 10);
   const row = await env.DB.prepare("SELECT v FROM kv WHERE k = 'daily'").first();
@@ -837,16 +850,7 @@ async function prepare(env) {
   const s = (srcRow.results && srcRow.results[0] && srcRow.results[0].v) || env.SOURCE || 'mock';
   if (ready && s === SRC) return;
   SRC = s;
-  const ver = await db.prepare("SELECT v FROM kv WHERE k = 'schema'").first();
-  if (!ver || ver.v !== SCHEMA) {
-    // Versión anterior solo con datos de prueba: se recrea.
-    await db.batch([
-      db.prepare('DROP TABLE IF EXISTS snapshots'),
-      db.prepare('DROP TABLE IF EXISTS refuels'),
-      db.prepare('DROP TABLE IF EXISTS trips'),
-      db.prepare("DELETE FROM kv WHERE k IN ('demo', 'state', 'live_cache')")
-    ]);
-  }
+  // El historial nunca se borra al actualizar: solo se crea lo que falta y se añaden columnas.
   await db.batch([
     db.prepare('CREATE TABLE IF NOT EXISTS snapshots (ts INTEGER PRIMARY KEY, odometer REAL, fuel_pct REAL, battery_v REAL, data TEXT)'),
     db.prepare('CREATE TABLE IF NOT EXISTS refuels (ts INTEGER PRIMARY KEY, odometer REAL, fuel_before REAL, fuel_after REAL, litres REAL, price_total REAL, station TEXT, price_auto INTEGER)'),
@@ -862,6 +866,7 @@ async function prepare(env) {
   ]);
   try { await db.prepare('ALTER TABLE trips ADD COLUMN track INTEGER DEFAULT 0').run(); } catch (e) { /* ya existe */ }
   try { await db.prepare('ALTER TABLE trips ADD COLUMN circuit TEXT').run(); } catch (e) { /* ya existe */ }
+  try { await db.prepare('ALTER TABLE refuels ADD COLUMN litres_ok INTEGER').run(); } catch (e) { /* ya existe */ }
   try { await db.prepare('ALTER TABLE refuels ADD COLUMN price_l REAL').run(); } catch (e) { /* ya existe */ }
   try { await db.prepare('ALTER TABLE refuels ADD COLUMN photo INTEGER').run(); } catch (e) { /* ya existe */ }
   try { await db.prepare('ALTER TABLE trips ADD COLUMN path TEXT').run(); } catch (e) { /* ya existe */ }
@@ -935,7 +940,7 @@ async function getHistory(env, days) {
 async function getBattery(env, days) {
   const from = Date.now() - days * 86400e3;
   const { results } = await env.DB.prepare(
-    `SELECT date((ts + 3600000) / 1000, 'unixepoch') AS d, MIN(battery_v) AS min, MAX(battery_v) AS max
+    `SELECT ${sqlDay('ts')} AS d, MIN(battery_v) AS min, MAX(battery_v) AS max
      FROM snapshots WHERE ts >= ? AND json_extract(data, '$.ignition') = 'off' GROUP BY d ORDER BY d`
   ).bind(from).all();
   const last7 = results.slice(-7);
@@ -968,7 +973,7 @@ async function getRefuels(env) {
     if (p) {
       km = round(r.odometer - p.odometer, 1);
       // Lleno a lleno (los dos al 97 % o más): los litros que entran son exactamente lo gastado. Si no, el aforador corregido.
-      const full = p.fuel_after >= 97 && r.fuel_after >= 97 && r.litres > 0;
+      const full = p.fuel_after >= 97 && r.fuel_after >= 97 && r.litres > 0 && !!r.litres_ok;
       const used = full ? r.litres : ((p.fuel_after - r.fuel_before) / 100) * TANK_L * ff;
       r.full_to_full = full;
       if (km > 20 && r.fuel_before != null && p.fuel_after != null) { l100 = round((used / km) * 100, 1); totalUsed += used; totalKm += km; }
@@ -1015,8 +1020,12 @@ async function updateRefuel(env, ts, body) {
   if (body.litres != null && body.litres !== '') {
     const l = Number(String(body.litres).replace(',', '.'));
     if (!(l > 1 && l <= TANK_L + 2)) throw httpError('Los litros no son válidos', 400);
-    await env.DB.prepare('UPDATE refuels SET litres = ? WHERE ts = ?').bind(l, ts).run();
-    await calibrateFuel(env, ts, l);
+    // Solo si cambian: reenviar el mismo valor no confirma la estimación ni vuelve a calibrar.
+    const old = await env.DB.prepare('SELECT litres FROM refuels WHERE ts = ?').bind(ts).first();
+    if (old && (old.litres == null || Math.abs(old.litres - l) > 0.05)) {
+      await env.DB.prepare('UPDATE refuels SET litres = ?, litres_ok = 1 WHERE ts = ?').bind(l, ts).run();
+      await calibrateFuel(env, ts, l);
+    }
   }
   const price = body.price_total === null || body.price_total === '' ? null : Number(body.price_total);
   if (price !== null && !(price > 0 && price < 1000)) throw httpError('El precio no es válido', 400);
@@ -1185,7 +1194,7 @@ async function siriText(env) {
   else {
     const where = c.location ? placeAt(c.location.lat, c.location.lon, places) || await geoName(env, c.location.lat, c.location.lon) : null;
     const open = [...(c.doors_open || []), ...(c.windows_open || [])];
-    out.push(c.locked === false ? `Ojo: el coche está abierto${where ? ' en ' + where : ''}.` : `El coche está cerrado${where ? ' en ' + where : ''}.`);
+    out.push(c.locked == null ? `No tengo el dato del cierre${where ? '. El coche está en ' + where : ''}.` : c.locked === false ? `Ojo: el coche está abierto${where ? ' en ' + where : ''}.` : `El coche está cerrado${where ? ' en ' + where : ''}.`);
     if (open.length) out.push('Abierto: ' + open.join(', ') + '.');
   }
   if (c.fuel_pct != null) out.push(`Gasolina al ${Math.round(c.fuel_pct)} por ciento${c.range_km ? ', unos ' + c.range_km + ' kilómetros' : ''}.`);
@@ -1220,7 +1229,7 @@ async function priceHistBackfill(env) {
   let day = null;
   for (let i = 1; i <= 90; i++) {
     if (waiting && i <= 2) continue;
-    const d = new Date(Date.now() + 3600e3 - i * 86400e3).toISOString().slice(0, 10);
+    const d = new Date(toLocal(Date.now() - i * 86400e3)).toISOString().slice(0, 10);
     if (!have.has(d) && !skip.has(f.id + d)) { day = d; break; }
   }
   if (!day) return;
@@ -1278,7 +1287,7 @@ async function refuelAdvice(env) {
   const l7 = hist.slice(-7).map(h => h[key]);
   const trend = l7.length >= 5 ? round((l7[l7.length - 1] - l7[0]) * 100, 1) : null;
   const diff = round((today - mean) * 100, 1); // céntimos sobre la media
-  const todayIdx = new Date(Date.now() + 3600e3).getUTCDay();
+  const todayIdx = new Date(toLocal(Date.now())).getUTCDay();
   let verdict, short;
   const min90 = Math.min(...hist.map(h => h[key]));
   const tr30 = round((today - last30[0]) * 100, 0);
@@ -1294,7 +1303,7 @@ async function refuelAdvice(env) {
 const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
 async function monthStats(env, ym) {
   const [y, m] = ym.split('-').map(Number);
-  const a = Date.UTC(y, m - 1, 1) - 3600e3, b = Date.UTC(y, m, 1) - 3600e3;
+  const a = fromLocal(Date.UTC(y, m - 1, 1)), b = fromLocal(Date.UTC(y, m, 1));
   const t = await env.DB.prepare('SELECT COUNT(*) n, SUM(km) km, SUM(duration_s) s, SUM(fuel_used_l) l, MAX(max_speed) vmax, SUM(CASE WHEN track = 1 THEN 1 ELSE 0 END) track FROM trips WHERE start_ts >= ? AND start_ts < ?').bind(a, b).first();
   const r = await env.DB.prepare('SELECT COUNT(*) n, SUM(litres) l, SUM(price_total) eur FROM refuels WHERE ts >= ? AND ts < ?').bind(a, b).first();
   const e = (await rawExpenses(env)).filter(x => x.date && x.date.slice(0, 7) === ym).reduce((s, x) => s + (x.eur || 0), 0);
@@ -1302,14 +1311,14 @@ async function monthStats(env, ym) {
     l100: t.km > 50 ? round(t.l / t.km * 100, 1) : null, vmax: t.vmax, track: t.track || 0, refuels: r.n || 0, refuel_l: round(r.l || 0, 1), fuel_eur: round(r.eur || 0, 2), other_eur: round(e, 2) };
 }
 async function monthSummary(env, ym) {
-  const now = new Date(Date.now() + 3600e3);
+  const now = new Date(toLocal(Date.now()));
   ym = /^\d{4}-\d{2}$/.test(ym || '') ? ym : now.toISOString().slice(0, 7);
   const [y, m] = ym.split('-').map(Number);
   const prevYm = new Date(Date.UTC(y, m - 2, 1)).toISOString().slice(0, 7);
   const cur = await monthStats(env, ym), prev = await monthStats(env, prevYm);
   // Ida y vuelta al trabajo este mes
   const places = await getPlaces(env);
-  const [ta, tb] = [Date.UTC(y, m - 1, 1) - 3600e3, Date.UTC(y, m, 1) - 3600e3];
+  const [ta, tb] = [fromLocal(Date.UTC(y, m - 1, 1)), fromLocal(Date.UTC(y, m, 1))];
   const { results } = await env.DB.prepare('SELECT points, km, fuel_used_l FROM trips WHERE start_ts >= ? AND start_ts < ?').bind(ta, tb).all();
   const price = await priceFinder(env);
   let wN = 0, wKm = 0, wL = 0;
@@ -1410,10 +1419,10 @@ async function engineStats(env, days) {
   const allMax = await env.DB.prepare('SELECT MAX(max_rpm) r, MAX(max_oil) t FROM trips').first();
   const cruise = live.filter(p => p.spd >= 110 && p.spd <= 125);
   const total_s = trips.reduce((a, t) => a + (t.duration_s || 0), 0);
-  const month0 = new Date(Date.now() + 3600e3); month0.setUTCDate(1); month0.setUTCHours(0, 0, 0, 0);
+  const month0 = new Date(toLocal(Date.now())); month0.setUTCDate(1); month0.setUTCHours(0, 0, 0, 0);
   return {
     days, samples: live.length, trips: per.length, score, tips,
-    rpm_bands: rpmBands, gears, gear_ratios: GEAR_KMH_PER_1000, scatter,
+    rpm_bands: rpmBands, gears, gear_ratios: GEARS_OK ? GEAR_KMH_PER_1000 : [], scatter,
     warm: per.filter(p => p.warm_min != null || !p.reached).map(p => ({ id: p.id, ts: p.ts, min: p.warm_min, reached: p.reached, km: p.km })),
     max_temp_trips: per.map(p => ({ id: p.id, ts: p.ts, t: p.max_temp })).filter(p => p.t),
     alternator: altS.map(p => ({ ts: p.ts, v: p.alt_v })), alt_avg: altAvg,
@@ -1422,7 +1431,7 @@ async function engineStats(env, days) {
       max_rpm: allMax.r, max_temp: allMax.t,
       over4000_min: Math.round(live.filter(p => p.rpm >= 4000).length / Math.max(1, live.length) * total_s / 60),
       cruise_rpm: cruise.length ? Math.round(cruise.reduce((a, p) => a + p.rpm, 0) / cruise.length) : null,
-      cold_starts_month: per.filter(p => p.cold_start && p.ts >= month0.getTime() - 3600e3).length,
+      cold_starts_month: per.filter(p => p.cold_start && p.ts >= fromLocal(month0.getTime())).length,
       short_pct: road.length ? Math.round(short.length / road.length * 100) : null
     }
   };
@@ -1535,8 +1544,10 @@ async function routeErr(env, id, msg) {
 const r2 = v => v == null ? null : Math.round(v * 100) / 100;
 // Relación km/h por cada 1.000 rpm de cada marcha (Fiesta ST Mk8, aprox.): sirve para deducir la marcha,
 // porque en cambio manual Ford no la manda.
+const GEARS_OK = false; // desactivado hasta tener las relaciones de cambio del Focus ST
 let GEAR_KMH_PER_1000 = [7.6, 13.4, 20.3, 27.0, 33.6, 40.6]; // se afinan solas con tus datos (calibrateGears)
 function gearFrom(speed, rpm) {
+  if (!GEARS_OK) return null;
   if (!speed || speed < 8 || !rpm || rpm < 1100) return null;
   const r = speed / (rpm / 1000);
   let best = null, err = 1e9;
@@ -1546,6 +1557,7 @@ function gearFrom(speed, rpm) {
 
 // Afina las relaciones de cambio con las lecturas reales (velocidad/rpm estables en cada marcha)
 async function calibrateGears(env) {
+  if (!GEARS_OK) return;
   const { results } = await env.DB.prepare("SELECT data FROM snapshots WHERE ts > ? ORDER BY ts").bind(Date.now() - 60 * 86400e3).all();
   const buckets = GEAR_KMH_PER_1000.map(() => []);
   for (const r of results) {
@@ -1595,7 +1607,7 @@ async function tripSeries(env, t) {
   return { series, stats };
 }
 
-const hhmm = ts => new Date(ts + 3600e3).toISOString().slice(11, 16);
+const hhmm = ts => new Date(toLocal(ts)).toISOString().slice(11, 16);
 
 // Precio por litro para un momento dado: último repostaje con precio antes de esa fecha,
 // si no el más reciente, si no la media de gasolineras cercanas, si no 1,70 €/L.
@@ -1604,7 +1616,7 @@ async function priceFinder(env) {
   let fallback = 1.70;
   const fc = await env.DB.prepare("SELECT v FROM kv WHERE k LIKE 'fuel_cache_%' LIMIT 1").first();
   if (fc) {
-    const key = 'p' + (env.FUEL_TYPE || '98');
+    const key = 'p' + await userFuelType(env);
     const ps = JSON.parse(fc.v).list.map(s => s[key]).filter(Boolean);
     if (ps.length) fallback = ps.reduce((a, b) => a + b, 0) / ps.length;
   }
@@ -1658,7 +1670,7 @@ async function favPriceDaily(env) {
   if (!fav || fav.missing) return;
   const row = await env.DB.prepare("SELECT v FROM kv WHERE k = 'fav_prices'").first();
   const hist = row ? JSON.parse(row.v) : [];
-  const d = new Date(Date.now() + 3600e3).toISOString().slice(0, 10);
+  const d = new Date(toLocal(Date.now())).toISOString().slice(0, 10);
   if (!hist.length || hist[hist.length - 1].d !== d) hist.push({ d, p95: fav.p95 ?? null, p98: fav.p98 ?? null });
   while (hist.length > 180) hist.shift();
   await env.DB.prepare("INSERT OR REPLACE INTO kv VALUES ('fav_prices', ?)").bind(JSON.stringify(hist)).run();
@@ -1759,7 +1771,7 @@ async function saveExpense(env, b) {
 
 async function listExpenses(env, year) {
   const y = Number(year) || new Date().getFullYear();
-  const from = Date.UTC(y, 0, 1) - 3600e3, to = Date.UTC(y + 1, 0, 1) - 3600e3;
+  const from = fromLocal(Date.UTC(y, 0, 1)), to = fromLocal(Date.UTC(y + 1, 0, 1));
   const items = (await rawExpenses(env)).filter(e => e.date.startsWith(String(y)));
   const { results: rf } = await env.DB.prepare('SELECT ts, price_total, litres, station FROM refuels WHERE ts >= ? AND ts < ? AND price_total > 0 ORDER BY ts DESC').bind(from, to).all();
   const fuel = round(rf.reduce((a, r) => a + r.price_total, 0), 2);
@@ -1795,11 +1807,12 @@ async function fordHealth(env, err) {
 // ---------- Copia de seguridad semanal (en un almacén aparte de la base de datos) ----------
 async function weeklyBackup(env, when) {
   if (!env.BACKUPS) return;
-  const local = new Date(when + 3600e3);
+  const local = new Date(toLocal(when));
   if (local.getUTCDay() !== 0 || local.getUTCHours() !== 4 || local.getUTCMinutes() !== 0) return; // domingos a las 4:00
   const data = JSON.stringify(await exportAll(env));
   const key = 'copia-' + local.toISOString().slice(0, 10);
-  await env.BACKUPS.put(key, data, { metadata: { bytes: data.length, at: Date.now() } });
+  const zip = await new Response(new Blob([data]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+  await env.BACKUPS.put(key, zip, { metadata: { bytes: zip.byteLength, at: Date.now(), gzip: true } });
   const { keys } = await env.BACKUPS.list({ prefix: 'copia-' });
   const old = keys.map(k => k.name).sort().slice(0, -12); // se quedan las 12 últimas (3 meses)
   for (const k of old) await env.BACKUPS.delete(k);
@@ -1813,16 +1826,18 @@ async function listBackups(env) {
 
 async function getBackup(env, name) {
   if (!env.BACKUPS || !/^copia-\d{4}-\d{2}-\d{2}$/.test(name)) throw httpError('Copia no encontrada', 404);
-  const v = await env.BACKUPS.get(name);
+  const v = await env.BACKUPS.get(name, 'arrayBuffer');
   if (!v) throw httpError('Copia no encontrada', 404);
-  return JSON.parse(v);
+  const b = new Uint8Array(v);
+  if (b[0] !== 0x1f || b[1] !== 0x8b) return JSON.parse(new TextDecoder().decode(b)); // copias antiguas sin comprimir
+  return JSON.parse(await new Response(new Blob([v]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
 }
 
 // ---------- Limpieza: lecturas de hace más de un año, una por día ----------
 async function pruneOld(env) {
   const cutoff = Date.now() - 365 * 86400e3;
   await env.DB.prepare(`DELETE FROM snapshots WHERE ts < ? AND ts NOT IN (
-    SELECT MIN(ts) FROM snapshots WHERE ts < ? GROUP BY date((ts + 3600000) / 1000, 'unixepoch'))`).bind(cutoff, cutoff).run();
+    SELECT MIN(ts) FROM snapshots WHERE ts < ? GROUP BY ${sqlDay('ts')})`).bind(cutoff, cutoff).run();
 }
 
 // ---------- Lugares guardados (Casa, Trabajo…) ----------
@@ -1956,7 +1971,7 @@ const FLUID_DAYS_PER_TRACKDAY = 60; // cada día de circuito adelanta 2 meses el
 
 async function trackSince(env, dateStr) {
   const since = dateStr ? Date.parse(dateStr + 'T00:00:00Z') : 0;
-  const r = await env.DB.prepare(`SELECT COALESCE(SUM(km), 0) AS km, COUNT(DISTINCT date((start_ts + 3600000) / 1000, 'unixepoch')) AS days
+  const r = await env.DB.prepare(`SELECT COALESCE(SUM(km), 0) AS km, COUNT(DISTINCT ${sqlDay('start_ts')}) AS days
     FROM trips WHERE track = 1 AND start_ts >= ?`).bind(since).first();
   return { km: r ? r.km : 0, days: r ? r.days : 0 };
 }
@@ -2059,7 +2074,7 @@ async function setTyreSet(env, b) {
       if (v && typeof v === 'object') { const z = { o: mm(v.o), c: mm(v.c), i: mm(v.i) }; return [z.o, z.c, z.i].some(x => x != null) ? z : null; }
       const x = mm(v); return x != null ? { o: null, c: x, i: null } : null;
     };
-    const m = { date: new Date(Date.now() + 3600e3).toISOString().slice(0, 10), km: await currentOdo(env) };
+    const m = { date: new Date(toLocal(Date.now())).toISOString().slice(0, 10), km: await currentOdo(env) };
     for (const k of ['fl', 'fr', 'rl', 'rr']) m[k] = zones(b.tread[k]);
     if (!['fl', 'fr', 'rl', 'rr'].some(k => m[k])) throw httpError('Pon al menos una medida en mm', 400);
     t.tread = [...(t.tread || []).filter(x => x.date !== m.date), m].slice(-20);
@@ -2080,7 +2095,7 @@ async function setTyreSet(env, b) {
 // ---------- Días de circuito ----------
 async function trackDays(env) {
   const { results } = await env.DB.prepare(
-    `SELECT date((start_ts + 3600000) / 1000, 'unixepoch') AS day, COALESCE(circuit, 'Circuito') AS circuit,
+    `SELECT ${sqlDay('start_ts')} AS day, COALESCE(circuit, 'Circuito') AS circuit,
       COUNT(*) AS sessions, SUM(km) AS km, SUM(duration_s) AS secs, MAX(max_speed) AS top_speed, MAX(max_rpm) AS top_rpm,
       MAX(max_oil) AS top_temp, SUM(fuel_used_l) AS fuel_l, MIN(start_ts) AS first_ts
      FROM trips WHERE track = 1 GROUP BY day, COALESCE(circuit, 'Circuito') ORDER BY day DESC LIMIT 60`).all();
@@ -2163,7 +2178,7 @@ async function widgetNext(env) {
 
 async function circuitStats(env) {
   const { results } = await env.DB.prepare(
-    `SELECT circuit, COUNT(*) AS sessions, COUNT(DISTINCT date((start_ts + 3600000) / 1000, 'unixepoch')) AS days,
+    `SELECT circuit, COUNT(*) AS sessions, COUNT(DISTINCT ${sqlDay('start_ts')}) AS days,
       MAX(max_speed) AS top_speed, MAX(max_rpm) AS top_rpm, MAX(max_oil) AS top_temp, SUM(km) AS km,
       SUM(duration_s) AS secs, MAX(start_ts) AS last_ts
      FROM trips WHERE circuit IS NOT NULL GROUP BY circuit ORDER BY last_ts DESC`
@@ -2180,9 +2195,9 @@ async function getTrack(env) {
 async function setTrack(env, b) {
   let until = null;
   if (b.until === 'midnight') {
-    const d = new Date(Date.now() + 3600e3);
+    const d = new Date(toLocal(Date.now()));
     d.setUTCHours(23, 59, 0, 0);
-    until = d.getTime() - 3600e3;
+    until = fromLocal(d.getTime());
   } else if (Number(b.hours) > 0 && Number(b.hours) <= 24) until = Date.now() + Number(b.hours) * 3600e3;
   await env.DB.prepare("INSERT OR REPLACE INTO kv VALUES ('track', ?)").bind(JSON.stringify({ until })).run();
   await env.DB.prepare("DELETE FROM kv WHERE k = 'live_cache'").run();
@@ -2487,7 +2502,7 @@ async function oilRate(env) {
   const drop = a.o - b.o;
   return drop > 0 && b.km > a.km ? round((b.km - a.km) / drop, 0) : null;
 }
-function etaDate(days) { return days == null || !isFinite(days) ? null : new Date(Date.now() + days * 86400e3 + 3600e3).toISOString().slice(0, 10); }
+function etaDate(days) { return days == null || !isFinite(days) ? null : new Date(toLocal(Date.now() + days * 86400e3)).toISOString().slice(0, 10); }
 
 async function listMaint(env) {
   const odo = await currentOdo(env);
@@ -2538,7 +2553,7 @@ async function saveMaint(env, b) {
 
 async function doneMaint(env, id) {
   const odo = await currentOdo(env);
-  const today = new Date(Date.now() + 3600e3).toISOString().slice(0, 10);
+  const today = new Date(toLocal(Date.now())).toISOString().slice(0, 10);
   await env.DB.prepare('UPDATE maintenance SET last_km = ?, last_date = ? WHERE id = ?').bind(odo, today, id).run();
   return listMaint(env);
 }
